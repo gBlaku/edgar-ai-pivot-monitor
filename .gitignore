@@ -1,0 +1,8 @@
+venv/
+*.log
+*.json
+.env
+.last_heartbeat
+__pycache__/
+*.pyc
+com.aipivot.monitor.plist.disabled
