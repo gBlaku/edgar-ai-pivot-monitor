@@ -2,7 +2,7 @@
 # AI Pivot Monitor - scheduled scan wrapper
 # Scans Mon-Fri 4:00 AM - 10:00 PM ET (pre-market through late after-hours)
 
-SCRIPT_DIR="/Users/gentblaku/ai-pivot-monitor"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="$SCRIPT_DIR/venv/bin/python3"
 SCRIPT="$SCRIPT_DIR/edgar_ai_pivot_monitor.py"
 LOG="$SCRIPT_DIR/scan.log"
