@@ -1,29 +1,41 @@
-#!/usr/bin/env python3
 """
 EDGAR AI Pivot Monitor
 ======================
-Monitors SEC EDGAR for nano-cap companies announcing AI rebrands/pivots.
-Tracks 8-K filings matching AI rebrand keywords, scrapes Finviz for
-pre-pivot candidates, and sends Discord alerts.
+Real-time classification pipeline over the SEC EDGAR full-text search API.
 
-Pattern: dying nano-cap Nasdaq shells with near-zero revenue suddenly
-file an 8-K announcing an AI rebrand → stock pops 300-600% overnight.
-Examples: $BIRD (+582%), $MYSE (+200%), $AIXC, $GRDX
+Polls EDGAR for newly published 8-K filings, scores them against a weighted
+keyword taxonomy, sends survivors to an LLM for structured evaluation, and
+dispatches the ones that clear a confidence threshold to Discord, Slack, ntfy
+or the macOS notification centre.
+
+The interesting engineering problems here are not the keywords:
+
+  * EDGAR full-text search is rate limited and requires a declared User-Agent.
+    Requests without one are refused.
+  * Filings routinely exceed an LLM context window, so _smart_excerpt() locates
+    the relevant passages rather than truncating at the head of the document.
+  * The same filing surfaces under multiple keyword queries and across repeated
+    polls, so evaluation and alerting are deduplicated separately, on disk, by
+    accession number. Evaluating twice costs money; alerting twice costs trust.
+  * Unattended operation needs a liveness signal, so a heartbeat distinguishes
+    "nothing matched" from "the process died".
 
 Usage:
     python edgar_ai_pivot_monitor.py                  # one-time scan (last 3 days)
     python edgar_ai_pivot_monitor.py --days 7         # scan last 7 days
-    python edgar_ai_pivot_monitor.py --watch           # continuous polling (every 5 min)
-    python edgar_ai_pivot_monitor.py --schedule        # smart polling (Tue-Thu 4-8pm ET only)
-    python edgar_ai_pivot_monitor.py --screener        # Finviz nano-cap screener
-    python edgar_ai_pivot_monitor.py --watchlist       # print watchlist
+    python edgar_ai_pivot_monitor.py --watch          # continuous polling
+    python edgar_ai_pivot_monitor.py --schedule       # windowed polling
+    python edgar_ai_pivot_monitor.py --screener       # Finviz nano-cap screener
+    python edgar_ai_pivot_monitor.py --watchlist      # print watchlist
 
 Setup:
     pip install -r requirements.txt
-    export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+    cp .env.example .env   # then fill in the values
 
-DISCLAIMER: Research tool only. Not financial advice. These are extremely
-speculative, high-risk situations. You can lose 100% of your capital.
+Set LOG_LEVEL=DEBUG for verbose diagnostics.
+
+DISCLAIMER: A research and monitoring tool. Nothing it emits is financial
+advice, and nothing here is a recommendation to buy or sell any security.
 """
 
 import requests
@@ -35,6 +47,22 @@ import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
+import logging
+
+# Diagnostics go to the logger; report surfaces stay on stdout via print().
+#
+# The split is deliberate rather than cosmetic. In --watch and --schedule modes this
+# runs unattended for days, where a bare print with no timestamp or level is useless
+# for working out what happened. But the alert card and the scan summary ARE the
+# product, and wrapping them in log formatting would make the tool worse to read.
+# So: anything about how the run is going is logged, anything a human asked to see
+# is printed.
+log = logging.getLogger("edgar")
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)-7s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 try:
     from bs4 import BeautifulSoup
@@ -133,9 +161,9 @@ FINVIZ_HEADERS = {
 }
 MAX_MARKET_CAP_M = 10  # Filter Finviz results to under $10M
 MAX_ALERT_MARKET_CAP_M = 200  # Skip Discord alerts for companies over $200M
-# Note: raised from $50M because BIRD-pattern shell conversions can show
-# post-pop market cap (e.g. BIRD at $107M after +500% spike). The pre-filing
-# market cap was much lower. When in doubt, alert and let analysis decide.
+# Note: raised from $50M because a shell conversion is often screened AFTER the
+# market has already repriced it (BIRD showed $107M post-announcement), while the
+# pre-filing cap was far lower. When in doubt, alert and let the analysis decide.
 
 # Persistent deduplication — track which filings we've already alerted on
 # so we don't ping Discord for the same 8-K every 5 minutes
@@ -168,7 +196,7 @@ def save_alerted(alerted: dict):
         with open(ALERTED_FILE, "w") as f:
             json.dump(pruned, f, indent=2)
     except Exception as e:
-        print(f"  [!] Could not save alerted file: {e}")
+        log.warning(f"Could not save alerted file: {e}")
 
 
 def mark_alerted(adsh: str, alerted: dict):
@@ -199,7 +227,7 @@ def save_evaluated(evaluated: dict):
         with open(EVALUATED_FILE, "w") as f:
             json.dump(pruned, f, indent=2)
     except Exception as e:
-        print(f"  [!] Could not save evaluated file: {e}")
+        log.warning(f"Could not save evaluated file: {e}")
 
 
 def mark_evaluated(adsh: str, verdict: str, confidence: int, evaluated: dict):
@@ -296,15 +324,15 @@ def search_edgar(query: str, forms: str = "8-K", days_back: int = 3) -> list:
                 time.sleep(2)
                 continue
             else:
-                print(f"  [!] EDGAR returned {resp.status_code} for: {query}")
+                log.warning(f"EDGAR returned {resp.status_code} for: {query}")
                 return []
         except requests.exceptions.Timeout:
             if attempt == 0:
                 time.sleep(2)
                 continue
-            print(f"  [!] EDGAR timeout for: {query}")
+            log.warning(f"EDGAR timeout for: {query}")
         except Exception as e:
-            print(f"  [!] EDGAR error: {e}")
+            log.error(f"EDGAR error: {e}")
             break
 
     return []
@@ -480,11 +508,11 @@ def evaluate_filing(filing: dict, market_data: Optional[dict] = None) -> dict:
         price = market_data.get("price", "?")
         revenue = market_data.get("sales", "?")
 
-    system_prompt = """You are a financial filing analyst specializing in nano-cap stock pump catalysts.
+    system_prompt = """You are a financial filing analyst specializing in corporate rebrand and pivot announcements.
 
-Your job: read SEC filings and judge whether the company is announcing a NEW pivot to AI/GPU/AI-infrastructure that would qualify as a "nano-cap AI rebrand pump" candidate. Two reference cases:
-- $MYSE: rebranded from "DatChat Inc." to "Myseum.AI, Inc." in April 2026 with an Item 5.03 charter amendment. Stock popped 200%+.
-- $BIRD: Allbirds entered an asset purchase agreement to sell its footwear business, then announced plans to rename to "NewBird AI, Inc." and use proceeds to purchase GPU assets for AI model training. Stock popped 500%+.
+Your job: read SEC filings and judge whether the company is announcing a NEW pivot to AI/GPU/AI-infrastructure. Two reference cases, both public filings:
+- $MYSE: rebranded from "DatChat Inc." to "Myseum.AI, Inc." in April 2026 via an Item 5.03 charter amendment.
+- $BIRD: Allbirds entered an asset purchase agreement to sell its footwear business, then announced plans to rename to "NewBird AI, Inc." and use proceeds to purchase GPU assets for AI model training.
 
 CONFIRM (confidence 8-10) ONLY if ALL of these are true:
 1. The company is small/nano-cap (< $200M market cap; sweet spot < $50M)
@@ -556,7 +584,7 @@ Is this a real nano-cap AI pivot announcement worthy of buying immediately, or a
             "tokens_out": resp.usage.completion_tokens,
         }
     except Exception as e:
-        print(f"  [!] OpenAI evaluation failed: {e}")
+        log.error(f"OpenAI evaluation failed: {e}")
         return {"confirmed": False, "confidence": 0,
                 "reasoning": f"OpenAI error: {e}",
                 "tokens_in": 0, "tokens_out": 0}
@@ -907,7 +935,7 @@ def scrape_finviz_screener() -> list:
     Returns list of dicts with ticker, company, market cap, price, etc.
     """
     if not HAS_BS4:
-        print("  [!] beautifulsoup4 required for Finviz scraper: pip install beautifulsoup4")
+        log.warning("beautifulsoup4 required for Finviz scraper: pip install beautifulsoup4")
         return []
 
     # Finviz screener filters:
@@ -932,7 +960,7 @@ def scrape_finviz_screener() -> list:
                 base_url, params=params, headers=FINVIZ_HEADERS, timeout=15
             )
             if resp.status_code != 200:
-                print(f"  [!] Finviz returned {resp.status_code}")
+                log.warning(f"Finviz returned {resp.status_code}")
                 break
 
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -996,7 +1024,7 @@ def scrape_finviz_screener() -> list:
             time.sleep(1)
 
         except Exception as e:
-            print(f"  [!] Finviz scraper error: {e}")
+            log.error(f"Finviz scraper error: {e}")
             break
 
     return all_results
@@ -1273,9 +1301,9 @@ def send_discord_alert(signal_level: str, filing: dict, keyword: str,
     try:
         resp = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
         if resp.status_code not in (200, 204):
-            print(f"  [!] Discord webhook returned {resp.status_code}: {resp.text[:200]}")
+            log.warning(f"Discord webhook returned {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        print(f"  [!] Discord alert failed: {e}")
+        log.error(f"Discord alert failed: {e}")
 
 
 def send_slack_alert(message: str):
@@ -1285,7 +1313,7 @@ def send_slack_alert(message: str):
     try:
         requests.post(SLACK_WEBHOOK, json={"text": message}, timeout=10)
     except Exception as e:
-        print(f"  [!] Slack alert failed: {e}")
+        log.error(f"Slack alert failed: {e}")
 
 
 def send_desktop_notification(title: str, message: str):
@@ -1314,7 +1342,7 @@ def klaxon_macos(ticker: str, company: str):
         safe_dialog = f"CONFIRMED AI PIVOT\\n\\n${safe_ticker}\\n{company[:60]}\\n\\nTap Buy to open Robinhood".replace('"', '\\"')
         os.system(f'''osascript -e 'display dialog "{safe_dialog}" with title "🚨 AI PIVOT ALERT 🚨" buttons {{"Dismiss", "Buy on Robinhood"}} default button 2 with icon stop' -e 'if button returned of result is "Buy on Robinhood" then do shell script "open https://robinhood.com/stocks/{safe_ticker}?source=search"' &''')
     except Exception as e:
-        print(f"  [!] Klaxon failed: {e}")
+        log.error(f"Klaxon failed: {e}")
 
 
 def send_ntfy_alert(title: str, message: str, ticker: str = "",
@@ -1361,9 +1389,9 @@ def send_ntfy_alert(title: str, message: str, ticker: str = "",
     try:
         resp = requests.post("https://ntfy.sh", json=payload, timeout=8)
         if resp.status_code not in (200, 204):
-            print(f"  [!] ntfy returned {resp.status_code}: {resp.text[:200]}")
+            log.warning(f"ntfy returned {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        print(f"  [!] ntfy alert failed: {e}")
+        log.error(f"ntfy alert failed: {e}")
 
 
 def send_heartbeat_if_due():
@@ -1391,9 +1419,9 @@ def send_heartbeat_if_due():
             }, timeout=8)
             with open(HEARTBEAT_FILE, "w") as f:
                 f.write(now.isoformat())
-            print(f"  [HEARTBEAT] Sent 'still running' ping to ntfy")
+            log.info("heartbeat ping sent to ntfy")
         except Exception as e:
-            print(f"  [!] Heartbeat failed: {e}")
+            log.error(f"Heartbeat failed: {e}")
 
 
 def alert(signal_level: str, filing: dict, keyword: str,
@@ -1421,12 +1449,12 @@ def alert(signal_level: str, filing: dict, keyword: str,
     if evaluated is not None and adsh and adsh in evaluated:
         prev = evaluated[adsh]
         prev_verdict = prev.get("verdict", "?") if isinstance(prev, dict) else "?"
-        print(f"  [DEDUP-EVAL] {adsh} — ${ticker or company[:15]} already evaluated ({prev_verdict})")
+        log.info(f"dedup: {adsh} ${ticker or company[:15]} already evaluated ({prev_verdict})")
         return False
 
     # === DEDUP 2: Already alerted? (legacy) ===
     if alerted is not None and adsh and adsh in alerted:
-        print(f"  [DEDUP-ALERT] {adsh} — ${ticker or company[:15]} already alerted")
+        log.info(f"dedup: {adsh} ${ticker or company[:15]} already alerted")
         return False
 
     # === FILTER: Market cap (cheap noise reduction before paying for GPT) ===
@@ -1436,7 +1464,7 @@ def alert(signal_level: str, filing: dict, keyword: str,
     if market_data and market_data.get("market_cap_m"):
         mcap = market_data["market_cap_m"]
         if mcap > MAX_ALERT_MARKET_CAP_M:
-            print(f"  [SKIP] ${ticker} — ${mcap:.0f}M market cap (over ${MAX_ALERT_MARKET_CAP_M}M)")
+            log.info(f"skip: ${ticker} at ${mcap:.0f}M exceeds ${MAX_ALERT_MARKET_CAP_M}M cap")
             # Don't waste GPT call on this; mark as evaluated so we don't recheck mcap
             if evaluated is not None:
                 mark_evaluated(adsh, "REJECTED_MCAP", 0, evaluated)
@@ -1444,7 +1472,7 @@ def alert(signal_level: str, filing: dict, keyword: str,
 
     # === GPT-4o reads the filing and decides ===
     ticker_display = f" (${ticker})" if ticker else ""
-    print(f"  [GPT] Reading filing for {company[:30]}{ticker_display}...")
+    log.info(f"evaluating filing: {company[:30]}{ticker_display}")
     result = evaluate_filing(filing, market_data)
 
     confirmed = result.get("confirmed", False)
@@ -1547,7 +1575,7 @@ Inc: {inc_state} | Items: {', '.join(items[:4])}
         # Mark as alerted (legacy compatibility)
         if alerted is not None:
             mark_alerted(adsh, alerted)
-            print(f"  [ALERTED] ${ticker} — added to dedup file")
+            log.info(f"alerted ${ticker}, recorded in dedup file")
         return True
 
     # GPT rejected or low confidence — silent, already logged
@@ -1597,7 +1625,7 @@ def scan_once(days_back: int = 3) -> int:
     for level, keywords in keyword_groups:
         print(f"[{level} SIGNAL KEYWORDS]")
         for kw in keywords:
-            print(f"  Searching: {kw}...")
+            log.info(f"searching: {kw}")
             results = search_edgar(kw, forms=FORM_TYPES, days_back=days_back)
 
             for filing in results:
@@ -1657,32 +1685,32 @@ def next_schedule_window() -> datetime:
 
 def watch_mode(days_back: int = 1):
     """Continuous polling every 5 minutes."""
-    print(f"Starting watch mode. Polling every {POLL_INTERVAL}s...")
+    log.info(f"watch mode starting, polling every {POLL_INTERVAL}s")
     print(f"Press Ctrl+C to stop.\n")
 
     while True:
         try:
             scan_once(days_back=days_back)
-            print(f"Next scan in {POLL_INTERVAL}s...\n")
+            log.info(f"next scan in {POLL_INTERVAL}s")
             time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
-            print("\nStopped.")
+            log.info("stopped")
             break
 
 
 def schedule_mode(days_back: int = 1):
     """Smart polling — only runs during after-hours windows (Tue-Thu 4-8pm ET)."""
-    print(f"Starting schedule mode.")
-    print(f"Polling window: Tue-Thu 4:00-8:00 PM ET, every {POLL_INTERVAL}s")
+    log.info("schedule mode starting")
+    log.info(f"polling window Tue-Thu 16:00-20:00 ET, every {POLL_INTERVAL}s")
     print(f"Press Ctrl+C to stop.\n")
 
     while True:
         try:
             if is_in_schedule_window():
                 now_et = datetime.now(ET)
-                print(f"[{now_et.strftime('%a %H:%M ET')}] Inside polling window — scanning...")
+                log.info("inside polling window, scanning")
                 scan_once(days_back=days_back)
-                print(f"Next scan in {POLL_INTERVAL}s...\n")
+                log.info(f"next scan in {POLL_INTERVAL}s")
                 time.sleep(POLL_INTERVAL)
             else:
                 next_window = next_schedule_window()
@@ -1690,9 +1718,9 @@ def schedule_mode(days_back: int = 1):
                 wait_seconds = (next_window - now_et).total_seconds()
                 wait_hours = wait_seconds / 3600
 
-                print(f"[{now_et.strftime('%a %H:%M ET')}] Outside polling window.")
-                print(f"  Next window: {next_window.strftime('%A %B %d at %I:%M %p ET')}")
-                print(f"  Sleeping for {wait_hours:.1f} hours...")
+                log.info("outside polling window")
+                log.info(f"next window {next_window.strftime('%A %B %d at %I:%M %p ET')}")
+                log.info(f"sleeping {wait_hours:.1f}h")
 
                 # Sleep in 60s chunks so Ctrl+C works
                 while wait_seconds > 0:
@@ -1702,7 +1730,7 @@ def schedule_mode(days_back: int = 1):
                         break
 
         except KeyboardInterrupt:
-            print("\nStopped.")
+            log.info("stopped")
             break
 
 
@@ -1740,14 +1768,37 @@ def print_watchlist():
 if __name__ == "__main__":
     args = sys.argv[1:]
 
+    # Validate before dispatching. The previous version fell through to a live scan on
+    # ANY unrecognised argument, so `--help` hit the SEC and OpenAI APIs instead of
+    # printing usage. Unknown input should cost nothing.
+    KNOWN = {"--days", "--screener", "--watchlist", "--schedule", "--watch", "--help", "-h"}
+    if {"--help", "-h"} & set(args):
+        print(__doc__)
+        sys.exit(0)
+
+    unknown = [a for a in args if a.startswith("-") and a not in KNOWN]
+    if unknown:
+        print(f"Unknown argument(s): {' '.join(unknown)}\n")
+        print(__doc__)
+        sys.exit(2)
+
     days = DEFAULT_LOOKBACK_DAYS
     if "--days" in args:
         idx = args.index("--days")
-        if idx + 1 < len(args):
+        if idx + 1 >= len(args):
+            print("--days requires a number, e.g. --days 7")
+            sys.exit(2)
+        try:
             days = int(args[idx + 1])
+        except ValueError:
+            print(f"--days expects an integer, got: {args[idx + 1]}")
+            sys.exit(2)
+        if days < 1:
+            print("--days must be at least 1")
+            sys.exit(2)
 
     if "--screener" in args:
-        print("Running Finviz nano-cap screener...")
+        log.info("running Finviz nano-cap screener")
         results = scrape_finviz_screener()
         print_finviz_results(results)
 
